@@ -20,7 +20,7 @@ export function normalizeApiBaseUrl(value) {
   if (typeof value !== "string" || value.length > 512) return null;
   try {
     const url = new URL(value);
-    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash) return null;
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password || url.search || url.hash) return null;
     if (url.pathname !== "/" && url.pathname !== "/v1") return null;
     return `${url.origin}/v1`;
   } catch {

@@ -46,8 +46,11 @@ function createContext() {
 
 test("validates loopback API URL and omits models with unknown context capacity", () => {
   assert.equal(normalizeApiBaseUrl("http://127.0.0.1:18133/v1"), "http://127.0.0.1:18133/v1");
+  assert.equal(normalizeApiBaseUrl("http://127.0.0.1:80/v1"), "http://127.0.0.1/v1");
+  assert.equal(normalizeApiBaseUrl("http://127.0.0.1/v1"), "http://127.0.0.1/v1");
   assert.equal(normalizeApiBaseUrl("https://127.0.0.1:18133/v1"), null);
   assert.equal(normalizeApiBaseUrl("http://localhost:18133/v1"), null);
+  assert.equal(normalizeApiBaseUrl("http://192.168.1.10:18133/v1"), null);
   assert.equal(normalizeApiBaseUrl("http://127.0.0.1:18133/v1?x=1"), null);
   const result = normalizeModels(connected.models);
   assert.equal(result.omittedUnknownContext, 1);
