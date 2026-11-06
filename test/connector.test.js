@@ -14,7 +14,7 @@ const connected = {
   ],
 };
 
-function createContext() {
+function createContext({ deferTransform = false } = {}) {
   const state = { providers: new Map(), hooks: [], activeHooks: new Set(), transforms: 0, reloads: 0 };
   let providerTransform;
   const ctx = {
@@ -26,7 +26,7 @@ function createContext() {
       transform: async (fn) => {
         providerTransform = fn;
         state.transforms++;
-        fn({ get: ctx.provider.get, add: ctx.provider.add, remove: ctx.provider.remove });
+        if (!deferTransform) state.flushTransform();
         return { dispose() {} };
       },
       reload: async () => {
@@ -43,6 +43,7 @@ function createContext() {
       },
     },
   };
+  state.flushTransform = () => providerTransform?.({ get: ctx.provider.get, add: ctx.provider.add, remove: ctx.provider.remove });
   return { ctx, state };
 }
 
@@ -151,14 +152,55 @@ test("authenticates allowed metadata reads and blocks unexpected routes", async 
   await stop();
 });
 
+test("authenticates the first request when OpenCode defers provider transforms until boot completes", async () => {
+  const calls = [];
+  const broker = async (_path, operation) => {
+    calls.push(operation);
+    return operation === "status" ? connected : { ...connected, api_key: syntheticCapability };
+  };
+  const { ctx, state } = createContext({ deferTransform: true });
+  const stop = await createStarkConnector({ requestBroker: broker }).setup(ctx);
+  try {
+    assert.equal(state.providers.has("stark"), false);
+    // OpenCode applies boot-time transforms after setup returns. As soon as
+    // this publishes a selectable model, its request hook must already exist.
+    state.flushTransform();
+    assert.equal(state.providers.has("stark"), true);
+    assert.equal(state.activeHooks.size, 1);
+    const event = {
+      model: { providerID: "stark" },
+      request: new Request(`${connected.api_base_url}/chat/completions`, {
+        method: "POST", headers: { authorization: `Bearer ${PUBLIC_PLACEHOLDER_KEY}` }, body: "synthetic-startup",
+      }),
+    };
+    await [...state.activeHooks][0].fn(event);
+    assert.equal(event.request.headers.get("authorization"), `Bearer ${syntheticCapability}`);
+    assert.equal(calls.filter((operation) => operation === "connection").length, 1);
+    assert.equal(state.reloads, 0);
+  } finally {
+    await stop();
+  }
+  assert.equal(state.activeHooks.size, 0);
+});
+
 test("does not replace a provider record owned by another configuration", async () => {
-  const broker = async (_path, operation) => operation === "status" ? connected : { ...connected, api_key: syntheticCapability };
+  const calls = [];
+  const broker = async (_path, operation) => {
+    calls.push(operation);
+    return operation === "status" ? connected : { ...connected, api_key: syntheticCapability };
+  };
   const { ctx, state } = createContext();
   const existing = { info: { id: "stark", name: "User Stark", package: "other", settings: { apiKey: "user-owned" } }, models: [] };
   state.providers.set("stark", existing);
   const stop = await createStarkConnector({ requestBroker: broker }).setup(ctx);
   assert.equal(state.providers.get("stark"), existing);
-  assert.equal(state.hooks.length, 0);
+  const request = new Request(`${connected.api_base_url}/chat/completions`, {
+    method: "POST", headers: { authorization: "Bearer synthetic-user-owned" }, body: "synthetic-foreign-provider",
+  });
+  const event = { model: { providerID: "stark" }, request };
+  await state.hooks[0].fn(event);
+  assert.equal(event.request, request);
+  assert.deepEqual(calls, ["status"]);
   await stop();
 });
 
@@ -169,7 +211,10 @@ test("rejects a broker endpoint that differs from the installed endpoint pin", a
   const { ctx, state } = createContext();
   const stop = await createStarkConnector({ requestBroker: broker }).setup(ctx);
   assert.equal(state.providers.has("stark"), false);
-  assert.equal(state.hooks.length, 0);
+  const event = { model: { providerID: "stark" }, request: new Request(`${connected.api_base_url}/models`) };
+  const request = event.request;
+  await state.hooks[0].fn(event);
+  assert.equal(event.request, request);
   await stop();
 });
 
@@ -218,7 +263,7 @@ test("reconciles model replacement through loading, including a text-only model 
       latest = { ...latest, models: [] };
       await poll();
       assert.equal(state.providers.has("stark"), false);
-      assert.equal(state.activeHooks.size, 0);
+      assert.equal(state.activeHooks.size, 1);
 
       latest = { ...latest, models: [replacement] };
       await poll();
@@ -293,47 +338,49 @@ test("retries a failed model-catalog reload even when the replacement status doe
   });
 });
 
-test("swallows a background hook-registration failure and retries on the next poll", async () => {
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const pollCallbacks = [];
-  const connectedStatus = { ...connected };
-  let statusCalls = 0;
-  let hookAttempts = 0;
+test("does not publish a provider when authentication hook registration fails", async () => {
   const { ctx, state } = createContext();
-  globalThis.setInterval = (callback) => {
-    pollCallbacks.push(callback);
-    return { unref() {} };
-  };
-  globalThis.clearInterval = () => {};
-  ctx.session.hook = async (name, fn, options) => {
-    hookAttempts++;
-    if (hookAttempts === 1) throw new Error("synthetic registration failure");
-    state.hooks.push({ name, fn, options });
-    return { dispose() {} };
-  };
-  const broker = async (_path, operation) => {
-    if (operation === "status") {
-      statusCalls++;
-      return statusCalls === 1 ? { version: 1, status: "not_connected" } : connectedStatus;
-    }
-    return { ...connectedStatus, api_key: syntheticCapability };
-  };
+  ctx.session.hook = async () => { throw new Error("synthetic registration failure"); };
+  const broker = async () => connected;
+  await assert.rejects(createStarkConnector({ requestBroker: broker }).setup(ctx), /synthetic registration failure/);
+  assert.equal(state.transforms, 0);
+  assert.equal(state.providers.has("stark"), false);
+  assert.equal(state.activeHooks.size, 0);
+});
 
-  try {
+test("cleans up the authentication hook when provider registration fails", async () => {
+  const { ctx, state } = createContext();
+  ctx.provider.transform = async () => { throw new Error("synthetic transform failure"); };
+  const broker = async () => connected;
+  await assert.rejects(createStarkConnector({ requestBroker: broker }).setup(ctx), /synthetic transform failure/);
+  assert.equal(state.hooks.length, 1);
+  assert.equal(state.activeHooks.size, 0);
+  assert.equal(state.providers.has("stark"), false);
+});
+
+test("keeps authentication ready when Stark connects after OpenCode boot", async () => {
+  await withManualPoll(async (poll) => {
+    let latest = { version: 1, status: "not_connected" };
+    const broker = async (_path, operation) => operation === "status" ? latest : { ...latest, api_key: syntheticCapability };
+    const { ctx, state } = createContext({ deferTransform: true });
     const stop = await createStarkConnector({ requestBroker: broker }).setup(ctx);
-    assert.equal(hookAttempts, 0);
-    assert.equal(pollCallbacks.length, 1);
-    pollCallbacks[0]();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(hookAttempts, 1);
-    pollCallbacks[0]();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(hookAttempts, 2);
-    assert.equal(state.hooks.length, 1);
-    await stop();
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-  }
+    try {
+      state.flushTransform();
+      assert.equal(state.providers.has("stark"), false);
+      assert.equal(state.activeHooks.size, 1);
+      latest = connected;
+      await poll();
+      assert.equal(state.providers.has("stark"), true);
+      const event = {
+        model: { providerID: "stark" },
+        request: new Request(`${connected.api_base_url}/chat/completions`, { method: "POST", body: "synthetic-connect-later" }),
+      };
+      await [...state.activeHooks][0].fn(event);
+      assert.equal(event.request.headers.get("authorization"), `Bearer ${syntheticCapability}`);
+      assert.equal(state.hooks.length, 1);
+    } finally {
+      await stop();
+    }
+    assert.equal(state.activeHooks.size, 0);
+  });
 });

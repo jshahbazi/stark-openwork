@@ -74,6 +74,14 @@ The provider uses OpenCode's OpenAI-compatible SDK package and the broker's exac
 
 The hook does not read or rewrite request bodies, so OpenCode's JSON payload and streaming body pass through unchanged. It rejects unexpected provider URLs, methods, paths, query strings, and fragments.
 
+The provider-scoped request hook is registered before the provider transform and
+kept until teardown. OpenCode batches provider transforms during startup and may
+apply them after plugin setup returns. Registering authentication first prevents
+the first selectable model from sending the public placeholder key. The hook
+leaves requests for a foreign `stark` provider unchanged when the connector does
+not own the published provider. If hook registration fails, setup stops before
+registering the provider transform.
+
 ## Development
 
 Run the dependency-free unit suite with `npm test` or `node --test`. These tests use a mock Unix socket and synthetic capabilities only; they do not contact Stark or OpenWork.

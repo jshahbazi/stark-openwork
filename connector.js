@@ -217,15 +217,6 @@ export function createStarkConnector(options = {}) {
         statusRevision++;
       };
 
-      const syncRequestHook = async () => {
-        if (providerActive && !hookRegistration && !stopped) {
-          hookRegistration = await ctx.session.hook("http.request", handleRequest, { providerID: PROVIDER_ID });
-        } else if (!providerActive && hookRegistration) {
-          await Promise.allSettled([hookRegistration?.dispose?.()]);
-          hookRegistration = null;
-        }
-      };
-
       const refresh = async () => {
         if (stopped) return;
         if (refreshInFlight) return refreshInFlight;
@@ -241,17 +232,13 @@ export function createStarkConnector(options = {}) {
           if (next.status === "connected" && next.apiBaseUrl !== expectedApiBaseUrl) next = unavailableStatus();
           statusChanged(next);
           const fingerprint = safeFingerprint(status);
-          if (fingerprint === appliedFingerprint) {
-            await syncRequestHook();
-            return;
-          }
+          if (fingerprint === appliedFingerprint) return;
           try {
             await ctx.provider.reload();
             appliedFingerprint = fingerprint;
           } catch {
             // Keep the fingerprint stale so the next poll retries the registry update.
           }
-          await syncRequestHook();
         })().finally(() => { refreshInFlight = null; });
         return refreshInFlight;
       };
@@ -315,8 +302,20 @@ export function createStarkConnector(options = {}) {
       }
       if (status.status === "connected" && status.apiBaseUrl !== expectedApiBaseUrl) statusChanged(unavailableStatus());
 
-      const providerRegistration = await ctx.provider.transform((editor) => { providerActive = publish(editor, status); });
-      await syncRequestHook();
+      // OpenCode batches provider transforms during boot: their callback can
+      // run only after setup returns. Install authentication first, so the
+      // first selectable model cannot send the public placeholder as a key.
+      // Keep the scoped hook for the full lifetime; it leaves foreign providers
+      // untouched while providerActive is false, including deferred reloads.
+      hookRegistration = await ctx.session.hook("http.request", handleRequest, { providerID: PROVIDER_ID });
+      let providerRegistration;
+      try {
+        providerRegistration = await ctx.provider.transform((editor) => { providerActive = publish(editor, status); });
+      } catch (error) {
+        stopped = true;
+        await Promise.allSettled([hookRegistration?.dispose?.()]);
+        throw error;
+      }
       appliedFingerprint = safeFingerprint(status);
       interval = setInterval(() => { void refresh().catch(() => {}); }, POLL_INTERVAL_MS);
       interval.unref?.();
